@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "profiles": {
+    "google:default": {
+      "type": "api_key",
+      "provider": "google",
+      "key": "<GOOGLE_API_KEY>"
+    },
+    "openai:default": {
+      "type": "api_key",
+      "provider": "openai",
+      "key": "<OPENAI_API_KEY>"
+    }
+  },
+  "lastGood": {
+    "google": "google:default",
+    "openai": "openai:default"
+  },
+  "usageStats": {
+    "google:default": {
+      "errorCount": 0
+    },
+    "openai:default": {
+      "errorCount": 0
+    }
+  }
+}

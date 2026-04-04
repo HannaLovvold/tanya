@@ -1,0 +1,168 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.3.24"
+  },
+  "wizard": {
+    "lastRunVersion": "2026.3.24",
+    "lastRunCommand": "onboard",
+    "lastRunMode": "local"
+  },
+  "auth": {
+    "profiles": {
+      "google:default": {
+        "provider": "google",
+        "mode": "api_key"
+      },
+      "openai:default": {
+        "provider": "openai",
+        "mode": "api_key"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openai/gpt-5.4"
+      },
+      "imageGenerationModel": {
+        "primary": "google/gemini-3.1-flash-image-preview"
+      },
+      "models": {
+        "openai/gpt-5.4": {}
+      },
+      "workspace": "/root/.openclaw/workspace",
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "1h"
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "humanDelay": {
+        "mode": "custom",
+        "minMs": 1500,
+        "maxMs": 4000
+      },
+      "typingMode": "never",
+      "heartbeat": {
+        "every": "10m",
+        "target": "last"
+      }
+    }
+  },
+  "tools": {
+    "profile": "full",
+    "web": {
+      "search": {
+        "enabled": true,
+        "provider": "gemini"
+      }
+    },
+    "media": {
+      "audio": {
+        "enabled": true,
+        "models": [
+          {
+            "provider": "openai",
+            "model": "gpt-4o-mini-transcribe"
+          }
+        ]
+      }
+    }
+  },
+  "messages": {
+    "tts": {
+      "auto": "inbound",
+      "provider": "elevenlabs",
+      "elevenlabs": {
+        "apiKey": "<ELEVENLABS_API_KEY>",
+        "voiceId": "<ELEVENLABS_VOICE_ID>",
+        "modelId": "eleven_v3",
+        "applyTextNormalization": "auto",
+        "voiceSettings": {
+          "stability": 0.45,
+          "similarityBoost": 0.8,
+          "style": 0.3,
+          "useSpeakerBoost": true,
+          "speed": 1
+        }
+      }
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true,
+    "ownerDisplay": "raw"
+  },
+  "session": {
+    "dmScope": "per-channel-peer",
+    "reset": {
+      "mode": "daily",
+      "atHour": 7
+    }
+  },
+  "hooks": {
+    "internal": {
+      "enabled": true,
+      "entries": {
+        "session-memory": {
+          "enabled": true
+        },
+        "command-logger": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "dmPolicy": "pairing",
+      "botToken": "<TELEGRAM_BOT_TOKEN>",
+      "groups": {
+        "*": {
+          "requireMention": true
+        }
+      },
+      "groupPolicy": "allowlist",
+      "streaming": "off"
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "loopback",
+    "auth": {
+      "mode": "token",
+      "token": "<GATEWAY_TOKEN>"
+    },
+    "tailscale": {
+      "mode": "off",
+      "resetOnExit": false
+    },
+    "nodes": {
+      "denyCommands": [
+        "camera.snap",
+        "camera.clip",
+        "screen.record",
+        "contacts.add",
+        "calendar.add",
+        "reminders.add",
+        "sms.send"
+      ]
+    }
+  },
+  "plugins": {
+    "entries": {
+      "google": {
+        "enabled": true,
+        "config": {
+          "webSearch": {
+            "apiKey": "<GOOGLE_API_KEY>"
+          }
+        }
+      }
+    }
+  }
+}

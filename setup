@@ -1,0 +1,1727 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_ROOT="${TANYA_TARGET_ROOT:-/root/.openclaw}"
+TARGET_WORKSPACE="$TARGET_ROOT/workspace"
+TARGET_AGENT_DIR="$TARGET_ROOT/agents/main/agent"
+TARGET_SCRIPTS="$TARGET_ROOT/scripts"
+TARGET_MEDIA="$TARGET_ROOT/media/tanya-image"
+MAIN_MODEL="${TANYA_MAIN_MODEL:-openai/gpt-5.4}"
+MODE="${1:-init}"
+VERSION="1.0.0"
+
+# ─────────────────────────────────────────────────────────────
+# Terminal colors and styling
+# ─────────────────────────────────────────────────────────────
+
+init_colors() {
+  if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+    local colors
+    colors="$(tput colors 2>/dev/null || echo 0)"
+    if [[ "$colors" -ge 8 ]]; then
+      BOLD="$(tput bold)"
+      DIM="$(tput dim)"
+      RESET="$(tput sgr0)"
+      BLUE="$(tput setaf 4)"
+      CYAN="$(tput setaf 6)"
+      GREEN="$(tput setaf 2)"
+      MAGENTA="$(tput setaf 5)"
+      RED="$(tput setaf 1)"
+      YELLOW="$(tput setaf 3)"
+      WHITE="$(tput setaf 7)"
+      return
+    fi
+  fi
+
+  BOLD=""
+  DIM=""
+  RESET=""
+  BLUE=""
+  CYAN=""
+  GREEN=""
+  MAGENTA=""
+  RED=""
+  YELLOW=""
+  WHITE=""
+}
+
+# ─────────────────────────────────────────────────────────────
+# Output helpers
+# ─────────────────────────────────────────────────────────────
+
+divider() {
+  printf '%s%s%s\n' "$DIM" "────────────────────────────────────────────────────────" "$RESET"
+}
+
+step_header() {
+  local step_num="$1"
+  local total="$2"
+  local title="$3"
+  echo
+  divider
+  printf '  %s%sStep %s of %s%s  %s%s%s\n' "$BOLD" "$CYAN" "$step_num" "$total" "$RESET" "$BOLD" "$title" "$RESET"
+  divider
+}
+
+section() {
+  echo
+  printf '  %s%s%s  %s\n' "$BOLD$MAGENTA" ">" "$RESET" "$BOLD$1$RESET"
+  echo
+}
+
+info() {
+  printf '  %s%s  %s%s\n' "$BLUE" "i" "$RESET" "$1"
+}
+
+hint() {
+  printf '  %s%s  %s%s\n' "$MAGENTA" "?" "$RESET" "$1"
+}
+
+good() {
+  printf '  %s%s  %s%s\n' "$GREEN" "+" "$RESET" "$1"
+}
+
+warn() {
+  printf '  %s%s  %s%s\n' "$YELLOW" "!" "$RESET" "$1"
+}
+
+die() {
+  echo
+  printf '  %s%s  %s%s\n' "$RED" "x" "$RESET" "$1" >&2
+  echo
+  exit 1
+}
+
+status_line() {
+  local label="$1"
+  local value="$2"
+  local color="${3:-$GREEN}"
+  printf '  %-28s %s%s%s\n' "$label" "$color" "$value" "$RESET"
+}
+
+key_help() {
+  local service="$1"
+  local url="$2"
+  local note="$3"
+  echo
+  printf '  %s%sWhere to get this:%s\n' "$DIM" "$BOLD" "$RESET"
+  printf '  %s%s%s\n' "$CYAN" "$url" "$RESET"
+  if [[ -n "$note" ]]; then
+    printf '  %s%s%s\n' "$DIM" "$note" "$RESET"
+  fi
+  echo
+}
+
+usage() {
+  cat <<EOF
+
+  ${BOLD}Usage:${RESET}
+    ./setup              First-time install
+    ./setup init         Same as above
+    ./setup configure    Update features on an existing install
+    ./setup uninstall    Remove Tanya and OpenClaw completely
+
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────────────────────
+
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    die "Missing required command: $1"
+  fi
+}
+
+validator_any() {
+  return 0
+}
+
+validator_phone() {
+  local value="$1"
+
+  if [[ -z "$value" ]]; then
+    return 0
+  fi
+
+  if [[ "$value" =~ ^\+[0-9]{8,15}$ ]]; then
+    return 0
+  fi
+
+  warn "Use full international format like +919512345678 with no spaces, hyphens, or brackets."
+  return 1
+}
+
+validator_chat_id() {
+  local value="$1"
+
+  if [[ "$value" =~ ^-?[0-9]+$ ]]; then
+    return 0
+  fi
+
+  warn "Telegram chat ID should be digits only, for example 123456789."
+  return 1
+}
+
+prompt_yes_no() {
+  local label="$1"
+  local default="$2"
+  local reply
+  local prompt
+  local normalized
+
+  if [[ "$default" == "Y" ]]; then
+    prompt="${GREEN}Y${RESET}/n"
+  else
+    prompt="y/${RED}N${RESET}"
+  fi
+
+  while true; do
+    printf '  %s%s  %s%s [%s] ' "$CYAN" ">" "$RESET" "$label" "$prompt"
+    read -r reply
+    if [[ -z "$reply" ]]; then
+      reply="$default"
+    fi
+    normalized="$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')"
+    case "$normalized" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+    esac
+  done
+}
+
+prompt_value() {
+  local var_name="$1"
+  local label="$2"
+  local secret="${3:-0}"
+  local required="${4:-1}"
+  local default_value="${5:-}"
+  local example="${6:-}"
+  local help_text="${7:-}"
+  local validator="${8:-validator_any}"
+  local reply
+  local prompt_suffix=""
+
+  if [[ -n "$help_text" ]]; then
+    hint "$help_text"
+  fi
+  if [[ -n "$example" ]]; then
+    printf '  %s  Example: %s%s\n' "$DIM" "$example" "$RESET"
+  fi
+
+  if [[ "$secret" == "1" && -n "$default_value" ]]; then
+    prompt_suffix=" ${DIM}[press Enter to keep current]${RESET}"
+  elif [[ -n "$default_value" ]]; then
+    prompt_suffix=" ${DIM}[$default_value]${RESET}"
+  fi
+
+  while true; do
+    if [[ "$secret" == "1" ]]; then
+      printf '  %s%s%s  %s%s: ' "$CYAN" ">" "$RESET" "$label" "$prompt_suffix"
+      read -r -s reply
+      echo
+    else
+      printf '  %s%s%s  %s%s: ' "$CYAN" ">" "$RESET" "$label" "$prompt_suffix"
+      read -r reply
+    fi
+
+    if [[ -z "$reply" && -n "$default_value" ]]; then
+      reply="$default_value"
+    fi
+
+    if [[ -z "$reply" && "$required" != "0" ]]; then
+      warn "This value is required."
+      continue
+    fi
+
+    if [[ -n "$reply" ]] && ! "$validator" "$reply"; then
+      continue
+    fi
+
+    printf -v "$var_name" '%s' "$reply"
+    return 0
+  done
+}
+
+generate_gateway_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24
+  else
+    python3 - <<'PY'
+import secrets
+print(secrets.token_hex(24))
+PY
+  fi
+}
+
+default_yes_no() {
+  if [[ "${1:-0}" == "1" ]]; then
+    printf 'Y'
+  else
+    printf 'N'
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Banner
+# ─────────────────────────────────────────────────────────────
+
+print_banner() {
+  echo
+  printf '%s' "$MAGENTA$BOLD"
+  cat <<'ART'
+
+      ████████╗ █████╗ ███╗   ██╗██╗   ██╗ █████╗
+      ╚══██╔══╝██╔══██╗████╗  ██║╚██╗ ██╔╝██╔══██╗
+         ██║   ███████║██╔██╗ ██║ ╚████╔╝ ███████║
+         ██║   ██╔══██║██║╚██╗██║  ╚██╔╝  ██╔══██║
+         ██║   ██║  ██║██║ ╚████║   ██║   ██║  ██║
+         ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝
+
+ART
+  printf '%s' "$RESET"
+  printf '      %sAI Companion Setup%s  %sv%s%s\n' "$BOLD" "$RESET" "$DIM" "$VERSION" "$RESET"
+  printf '      %sPowered by OpenClaw%s\n' "$DIM" "$RESET"
+  echo
+  divider
+
+  if [[ "$MODE" == "configure" ]]; then
+    echo
+    info "Configure mode: update features without touching live state or memory."
+    info "Press Enter on any prompt to keep the current value."
+  else
+    echo
+    info "This wizard will set up Tanya on this machine."
+    info "It takes about 5 minutes. You'll need a few API keys."
+  fi
+  echo
+  hint "You can come back later and update anything with ${BOLD}./setup configure${RESET}"
+  echo
+}
+
+# ─────────────────────────────────────────────────────────────
+# Load existing config (for configure mode defaults)
+# ─────────────────────────────────────────────────────────────
+
+load_existing_defaults() {
+  DEFAULT_USER_NAME=""
+  DEFAULT_TELEGRAM_USERNAME=""
+  DEFAULT_TELEGRAM_CHAT_ID=""
+  DEFAULT_USER_PHONE=""
+  DEFAULT_TELEGRAM_BOT_TOKEN=""
+  DEFAULT_OPENAI_API_KEY=""
+  DEFAULT_GOOGLE_API_KEY=""
+  DEFAULT_WEB_SEARCH_API_KEY=""
+  DEFAULT_ELEVENLABS_API_KEY=""
+  DEFAULT_ELEVENLABS_VOICE_ID=""
+  DEFAULT_ELEVENLABS_AGENT_ID=""
+  DEFAULT_ELEVENLABS_PHONE_NUMBER_ID=""
+  DEFAULT_ENABLE_IMAGES=0
+  DEFAULT_ENABLE_VOICE=0
+  DEFAULT_ENABLE_CALLS=0
+  DEFAULT_ENABLE_WEB=0
+
+  eval "$(
+    python3 - <<'PY'
+import json
+import os
+import pathlib
+import re
+import shlex
+
+target_root = pathlib.Path(os.environ["TARGET_ROOT"])
+workspace = target_root / "workspace"
+agent_dir = target_root / "agents" / "main" / "agent"
+call_script = target_root / "scripts" / "call_user.sh"
+
+values = {
+    "DEFAULT_USER_NAME": "",
+    "DEFAULT_TELEGRAM_USERNAME": "",
+    "DEFAULT_TELEGRAM_CHAT_ID": "",
+    "DEFAULT_USER_PHONE": "",
+    "DEFAULT_TELEGRAM_BOT_TOKEN": "",
+    "DEFAULT_OPENAI_API_KEY": "",
+    "DEFAULT_GOOGLE_API_KEY": "",
+    "DEFAULT_WEB_SEARCH_API_KEY": "",
+    "DEFAULT_ELEVENLABS_API_KEY": "",
+    "DEFAULT_ELEVENLABS_VOICE_ID": "",
+    "DEFAULT_ELEVENLABS_AGENT_ID": "",
+    "DEFAULT_ELEVENLABS_PHONE_NUMBER_ID": "",
+    "DEFAULT_ENABLE_IMAGES": "0",
+    "DEFAULT_ENABLE_VOICE": "0",
+    "DEFAULT_ENABLE_CALLS": "0",
+    "DEFAULT_ENABLE_WEB": "0",
+}
+
+def clean(value: str) -> str:
+    if value in {"pending-pairing", "not-set", "not-shared", ""}:
+        return ""
+    return value.strip()
+
+agents_path = workspace / "AGENTS.md"
+if agents_path.exists():
+    text = agents_path.read_text()
+    patterns = {
+        "DEFAULT_USER_NAME": r"- Name:\s*(.+)",
+        "DEFAULT_TELEGRAM_USERNAME": r"- Telegram username:\s*(.+)",
+        "DEFAULT_TELEGRAM_CHAT_ID": r"- Telegram chat ID:\s*(.+)",
+        "DEFAULT_USER_PHONE": r"- Phone number:\s*(.+)",
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text)
+        if match:
+            values[key] = clean(match.group(1))
+
+openclaw_path = target_root / "openclaw.json"
+if openclaw_path.exists():
+    try:
+        data = json.loads(openclaw_path.read_text())
+    except Exception:
+        data = {}
+    telegram = (((data.get("channels") or {}).get("telegram")) or {})
+    tools = data.get("tools") or {}
+    media_audio = ((tools.get("media") or {}).get("audio")) or {}
+    web_search = (((tools.get("web") or {}).get("search")) or {})
+    defaults = (((data.get("agents") or {}).get("defaults")) or {})
+    image_model = defaults.get("imageGenerationModel") or {}
+    messages = data.get("messages") or {}
+    eleven = ((messages.get("tts") or {}).get("elevenlabs")) or {}
+    plugins = (((data.get("plugins") or {}).get("entries")) or {})
+    google_plugin = (plugins.get("google") or {}).get("config") or {}
+    google_web = google_plugin.get("webSearch") or {}
+
+    values["DEFAULT_TELEGRAM_BOT_TOKEN"] = telegram.get("botToken", "")
+    values["DEFAULT_ENABLE_IMAGES"] = "1" if image_model.get("primary") else "0"
+    values["DEFAULT_ENABLE_VOICE"] = "1" if media_audio.get("enabled") else "0"
+    values["DEFAULT_ENABLE_WEB"] = "1" if web_search.get("enabled") else "0"
+    values["DEFAULT_ELEVENLABS_API_KEY"] = eleven.get("apiKey", "")
+    values["DEFAULT_ELEVENLABS_VOICE_ID"] = eleven.get("voiceId", "")
+    values["DEFAULT_WEB_SEARCH_API_KEY"] = google_web.get("apiKey", "")
+
+auth_profiles_path = agent_dir / "auth-profiles.json"
+if auth_profiles_path.exists():
+    try:
+        auth_data = json.loads(auth_profiles_path.read_text())
+    except Exception:
+        auth_data = {}
+    profiles = auth_data.get("profiles") or {}
+    values["DEFAULT_OPENAI_API_KEY"] = ((profiles.get("openai:default") or {}).get("key")) or values["DEFAULT_OPENAI_API_KEY"]
+    values["DEFAULT_GOOGLE_API_KEY"] = (profiles.get("google:default") or {}).get("key", "")
+
+if call_script.exists():
+    call_text = call_script.read_text()
+    patterns = {
+        "DEFAULT_ELEVENLABS_API_KEY": r'ELEVENLABS_API_KEY="\$\{ELEVENLABS_API_KEY:-([^}]*)\}"',
+        "DEFAULT_ELEVENLABS_AGENT_ID": r'ELEVENLABS_AGENT_ID="\$\{ELEVENLABS_AGENT_ID:-([^}]*)\}"',
+        "DEFAULT_ELEVENLABS_PHONE_NUMBER_ID": r'ELEVENLABS_PHONE_NUMBER_ID="\$\{ELEVENLABS_PHONE_NUMBER_ID:-([^}]*)\}"',
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, call_text)
+        if match:
+            candidate = match.group(1).strip()
+            if not (candidate.startswith("<") and candidate.endswith(">")):
+                values[key] = candidate
+
+if values["DEFAULT_ELEVENLABS_API_KEY"] and values["DEFAULT_ELEVENLABS_AGENT_ID"] and values["DEFAULT_ELEVENLABS_PHONE_NUMBER_ID"]:
+    values["DEFAULT_ENABLE_CALLS"] = "1"
+
+for key, value in values.items():
+    print(f"{key}={shlex.quote(str(value))}")
+PY
+  )"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Show current configuration status (configure mode)
+# ─────────────────────────────────────────────────────────────
+
+show_current_status() {
+  section "Current Configuration"
+
+  local mask="****"
+
+  if [[ -n "$DEFAULT_USER_NAME" ]]; then
+    status_line "Name:" "$DEFAULT_USER_NAME"
+  else
+    status_line "Name:" "not set" "$YELLOW"
+  fi
+
+  if [[ -n "$DEFAULT_TELEGRAM_BOT_TOKEN" ]]; then
+    status_line "Telegram bot:" "configured" "$GREEN"
+  else
+    status_line "Telegram bot:" "not configured" "$YELLOW"
+  fi
+
+  if [[ -n "$DEFAULT_TELEGRAM_CHAT_ID" ]]; then
+    status_line "Telegram chat ID:" "$DEFAULT_TELEGRAM_CHAT_ID"
+  else
+    status_line "Telegram chat ID:" "pending" "$YELLOW"
+  fi
+
+  if [[ -n "$DEFAULT_OPENAI_API_KEY" ]]; then
+    status_line "OpenAI API key:" "configured" "$GREEN"
+  else
+    status_line "OpenAI API key:" "not configured" "$RED"
+  fi
+
+  if [[ -n "$DEFAULT_GOOGLE_API_KEY" ]]; then
+    status_line "Google API key (images):" "configured" "$GREEN"
+  else
+    status_line "Google API key (images):" "not configured" "$DIM"
+  fi
+
+  if [[ -n "$DEFAULT_WEB_SEARCH_API_KEY" ]]; then
+    status_line "Google API key (web search):" "configured" "$GREEN"
+  else
+    status_line "Google API key (web search):" "not configured" "$DIM"
+  fi
+
+  echo
+  divider
+  echo
+
+  local img_status voice_status web_status call_status
+  if [[ "$DEFAULT_ENABLE_IMAGES" == "1" ]]; then
+    img_status="${GREEN}enabled${RESET}"
+  else
+    img_status="${DIM}disabled${RESET}"
+  fi
+  if [[ "$DEFAULT_ENABLE_VOICE" == "1" ]]; then
+    voice_status="${GREEN}enabled${RESET}"
+  else
+    voice_status="${DIM}disabled${RESET}"
+  fi
+  if [[ "$DEFAULT_ENABLE_WEB" == "1" ]]; then
+    web_status="${GREEN}enabled${RESET}"
+  else
+    web_status="${DIM}disabled${RESET}"
+  fi
+  if [[ "$DEFAULT_ENABLE_CALLS" == "1" ]]; then
+    call_status="${GREEN}enabled${RESET}"
+  else
+    call_status="${DIM}disabled${RESET}"
+  fi
+
+  printf '  %-28s %s\n' "Selfies & photos:" "$img_status"
+  printf '  %-28s %s\n' "Voice notes:" "$voice_status"
+  printf '  %-28s %s\n' "Web discovery:" "$web_status"
+  printf '  %-28s %s\n' "Phone calls:" "$call_status"
+  echo
+}
+
+# ─────────────────────────────────────────────────────────────
+# Configure mode menu
+# ─────────────────────────────────────────────────────────────
+
+show_configure_menu() {
+  section "What would you like to configure?"
+
+  echo "  ${BOLD}1${RESET}  Core settings      ${DIM}(name, Telegram bot, OpenAI key)${RESET}"
+  echo "  ${BOLD}2${RESET}  Selfies & photos   ${DIM}(image generation via Google)${RESET}"
+  echo "  ${BOLD}3${RESET}  Voice notes        ${DIM}(text-to-speech via ElevenLabs)${RESET}"
+  echo "  ${BOLD}4${RESET}  Web discovery      ${DIM}(web search via Google)${RESET}"
+  echo "  ${BOLD}5${RESET}  Phone calls        ${DIM}(calling via ElevenLabs + Twilio)${RESET}"
+  echo
+  echo "  ${BOLD}6${RESET}  Reinstall crons    ${DIM}(re-add scheduled jobs)${RESET}"
+  echo "  ${BOLD}7${RESET}  Telegram pairing   ${DIM}(pair or re-pair your Telegram account)${RESET}"
+  echo
+  echo "  ${BOLD}8${RESET}  Everything         ${DIM}(walk through all settings + crons + pairing)${RESET}"
+  echo
+
+  local choice
+  while true; do
+    printf '  %s%s%s  Pick an option [1-8]: ' "$CYAN" ">" "$RESET"
+    read -r choice
+    case "$choice" in
+      1|2|3|4|5|6|7|8) break ;;
+      *) warn "Please enter a number from 1 to 8." ;;
+    esac
+  done
+
+  CONFIGURE_CHOICE="$choice"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Step 1: Core setup
+# ─────────────────────────────────────────────────────────────
+
+show_core_setup() {
+  local total_steps="$1"
+  step_header "1" "$total_steps" "Core Settings"
+
+  info "These are the basics Tanya needs to come alive on Telegram."
+  echo
+
+  prompt_value USER_NAME \
+    "Your name" \
+    0 1 "$DEFAULT_USER_NAME" \
+    "Abhimanyu" \
+    "Tanya will know you by this name." \
+    validator_any
+
+  prompt_value USER_PHONE \
+    "Your phone number with country code (optional, press Enter to skip)" \
+    0 0 "$DEFAULT_USER_PHONE" \
+    "+919512345678" \
+    "Needed only if you want phone calls later." \
+    validator_phone
+
+  echo
+  divider
+  echo
+  info "Now let's set up your Telegram bot."
+  key_help "Telegram" \
+    "https://t.me/BotFather" \
+    "Message @BotFather on Telegram > /newbot > follow prompts > copy the token."
+
+  prompt_value TELEGRAM_BOT_TOKEN \
+    "Telegram bot token" \
+    1 1 "$DEFAULT_TELEGRAM_BOT_TOKEN" \
+    "123456789:AAExampleBotTokenHere" \
+    "" \
+    validator_any
+
+  echo
+  divider
+  echo
+  info "Tanya's brain runs on OpenAI. You'll need an API key with credits."
+  key_help "OpenAI" \
+    "https://platform.openai.com/api-keys" \
+    "Create an account > API Keys > Create new key. Requires a paid account with credits."
+
+  prompt_value OPENAI_API_KEY \
+    "OpenAI API key" \
+    1 1 "$DEFAULT_OPENAI_API_KEY" \
+    "sk-proj-..." \
+    "" \
+    validator_any
+}
+
+# ─────────────────────────────────────────────────────────────
+# Feature: Selfies & photos
+# ─────────────────────────────────────────────────────────────
+
+configure_images() {
+  local total_steps="${1:-}"
+
+  if [[ -n "$total_steps" ]]; then
+    step_header "2" "$total_steps" "Selfies & Photo Sharing"
+  else
+    section "Selfies & Photo Sharing"
+  fi
+
+  info "Tanya can share selfies, paintings, food photos, and little moments."
+  info "Uses Google Gemini for image generation."
+  echo
+  printf '  %s%sRequires:%s  Google API key with billing enabled\n' "$BOLD" "$WHITE" "$RESET"
+  echo
+
+  if prompt_yes_no "Enable selfies and photo sharing?" "$(default_yes_no "$DEFAULT_ENABLE_IMAGES")"; then
+    ENABLE_IMAGES=1
+    local _img_default="${GOOGLE_API_KEY:-$DEFAULT_GOOGLE_API_KEY}"
+    if [[ -z "$_img_default" ]]; then
+      key_help "Google AI" \
+        "https://aistudio.google.com/apikey" \
+        "Create a key in AI Studio or Cloud Console. Billing must be enabled."
+    else
+      info "A Google API key is configured. Press Enter to keep it, or enter a new one."
+    fi
+    prompt_value GOOGLE_API_KEY \
+      "Google API key for images" \
+      1 1 "$_img_default" \
+      "AIza..." \
+      "" \
+      validator_any
+  else
+    ENABLE_IMAGES=0
+    info "Skipped. Enable later with ${BOLD}./setup configure${RESET}"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Feature: Voice notes
+# ─────────────────────────────────────────────────────────────
+
+configure_voice() {
+  local total_steps="${1:-}"
+
+  if [[ -n "$total_steps" ]]; then
+    step_header "3" "$total_steps" "Voice Notes"
+  else
+    section "Voice Notes"
+  fi
+
+  info "Send Tanya voice notes and hear her reply in her own voice."
+  info "Uses ElevenLabs for text-to-speech and OpenAI for transcription."
+  echo
+  printf '  %s%sRequires:%s  ElevenLabs API key + voice ID  %s(free tier: 10k chars/month)%s\n' "$BOLD" "$WHITE" "$RESET" "$DIM" "$RESET"
+  echo
+
+  if prompt_yes_no "Enable voice notes?" "$(default_yes_no "$DEFAULT_ENABLE_VOICE")"; then
+    ENABLE_VOICE=1
+    if [[ -z "$ELEVENLABS_API_KEY" ]]; then
+      key_help "ElevenLabs" \
+        "https://elevenlabs.io" \
+        "Create free account > Profile + API key (left sidebar) > copy key."
+      prompt_value ELEVENLABS_API_KEY \
+        "ElevenLabs API key" \
+        1 1 "$DEFAULT_ELEVENLABS_API_KEY" \
+        "sk_..." \
+        "" \
+        validator_any
+    else
+      good "Using the ElevenLabs API key already entered."
+    fi
+
+    echo
+    hint "Pick or create a voice in ElevenLabs > Voices > click the voice > copy Voice ID."
+    prompt_value ELEVENLABS_VOICE_ID \
+      "ElevenLabs voice ID" \
+      0 1 "${DEFAULT_ELEVENLABS_VOICE_ID:-ulZgFXalzbrnPUGQGs0S}" \
+      "ulZgFXalzbrnPUGQGs0S" \
+      "" \
+      validator_any
+  else
+    ENABLE_VOICE=0
+    info "Skipped. Enable later with ${BOLD}./setup configure${RESET}"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Feature: Web discovery
+# ─────────────────────────────────────────────────────────────
+
+configure_web() {
+  local total_steps="${1:-}"
+
+  if [[ -n "$total_steps" ]]; then
+    step_header "4" "$total_steps" "Web Discovery"
+  else
+    section "Web Discovery"
+  fi
+
+  info "Tanya can look things up online, stay current, and share discoveries."
+  info "Uses Google search via Gemini."
+  echo
+  printf '  %s%sRequires:%s  Google API key  %s(free tier available)%s\n' "$BOLD" "$WHITE" "$RESET" "$DIM" "$RESET"
+  echo
+
+  if prompt_yes_no "Enable web discovery?" "$(default_yes_no "$DEFAULT_ENABLE_WEB")"; then
+    ENABLE_WEB=1
+    local _web_default="${WEB_SEARCH_API_KEY:-${GOOGLE_API_KEY:-$DEFAULT_WEB_SEARCH_API_KEY}}"
+    if [[ -z "$_web_default" ]]; then
+      key_help "Google AI" \
+        "https://aistudio.google.com/apikey" \
+        "Create a key in AI Studio or Cloud Console. Free tier works for web search."
+    else
+      info "A Google API key is available. Press Enter to keep it, or enter a new one."
+    fi
+    prompt_value WEB_SEARCH_API_KEY \
+      "Google API key for web search" \
+      1 1 "${WEB_SEARCH_API_KEY:-${GOOGLE_API_KEY:-$DEFAULT_WEB_SEARCH_API_KEY}}" \
+      "AIza..." \
+      "" \
+      validator_any
+  else
+    ENABLE_WEB=0
+    info "Skipped. Enable later with ${BOLD}./setup configure${RESET}"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Feature: Phone calls
+# ─────────────────────────────────────────────────────────────
+
+configure_calls() {
+  local total_steps="${1:-}"
+
+  if [[ -n "$total_steps" ]]; then
+    step_header "5" "$total_steps" "Phone Calls"
+  else
+    section "Phone Calls"
+  fi
+
+  info "Tanya can call you and you can talk to her over the phone."
+  info "Uses ElevenLabs Conversational AI + a Twilio phone number."
+  echo
+  printf '  %s%sRequires:%s  ElevenLabs API key + Agent ID + Twilio number\n' "$BOLD" "$WHITE" "$RESET"
+  printf '           %s(Twilio: free trial available with $15 credit)%s\n' "$DIM" "$RESET"
+  echo
+
+  if prompt_yes_no "Enable phone calls?" "$(default_yes_no "$DEFAULT_ENABLE_CALLS")"; then
+    ENABLE_CALLS=1
+
+    if [[ -z "$USER_PHONE" ]]; then
+      prompt_value USER_PHONE \
+        "Your phone number for calls" \
+        0 1 "$DEFAULT_USER_PHONE" \
+        "+919512345678" \
+        "Use full international format." \
+        validator_phone
+    fi
+
+    if [[ -z "$ELEVENLABS_API_KEY" ]]; then
+      key_help "ElevenLabs" \
+        "https://elevenlabs.io" \
+        "Create free account > Profile + API key (left sidebar) > copy key."
+      prompt_value ELEVENLABS_API_KEY \
+        "ElevenLabs API key" \
+        1 1 "$DEFAULT_ELEVENLABS_API_KEY" \
+        "sk_..." \
+        "" \
+        validator_any
+    else
+      good "Using the ElevenLabs API key already entered."
+    fi
+
+    echo
+    hint "Create an Agent in ElevenLabs > Agents > New Agent > copy the Agent ID."
+    key_help "ElevenLabs Agents" \
+      "https://elevenlabs.io/app/conversational-ai" \
+      "Create agent > configure voice & prompt > copy agent_id from settings."
+
+    prompt_value ELEVENLABS_AGENT_ID \
+      "ElevenLabs agent ID" \
+      0 1 "$DEFAULT_ELEVENLABS_AGENT_ID" \
+      "agent_4801kn0t38g8ehrae9rzvnq1x4d8" \
+      "" \
+      validator_any
+
+    echo
+    hint "Import your Twilio number into ElevenLabs to get a phone number ID."
+    key_help "Twilio" \
+      "https://console.twilio.com" \
+      "Create free account > buy a number > import into ElevenLabs Agents > Phone Numbers."
+
+    prompt_value ELEVENLABS_PHONE_NUMBER_ID \
+      "ElevenLabs phone number ID (from Twilio import)" \
+      0 1 "$DEFAULT_ELEVENLABS_PHONE_NUMBER_ID" \
+      "phnum_7901kn29j3zcfh1v9vphvvtaf624" \
+      "" \
+      validator_any
+  else
+    ENABLE_CALLS=0
+    info "Skipped. Enable later with ${BOLD}./setup configure${RESET}"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Summary
+# ─────────────────────────────────────────────────────────────
+
+show_summary() {
+  echo
+  divider
+  section "Review Your Configuration"
+
+  status_line "Model:" "$MAIN_MODEL" "$CYAN"
+  status_line "Telegram bot:" "configured" "$GREEN"
+  echo
+
+  if [[ "$ENABLE_IMAGES" == "1" ]]; then
+    printf '  %s+%s  Selfies & photos       %senabled%s\n' "$GREEN" "$RESET" "$GREEN" "$RESET"
+  else
+    printf '  %s-%s  Selfies & photos       %sdisabled%s\n' "$DIM" "$RESET" "$DIM" "$RESET"
+  fi
+  if [[ "$ENABLE_VOICE" == "1" ]]; then
+    printf '  %s+%s  Voice notes            %senabled%s\n' "$GREEN" "$RESET" "$GREEN" "$RESET"
+  else
+    printf '  %s-%s  Voice notes            %sdisabled%s\n' "$DIM" "$RESET" "$DIM" "$RESET"
+  fi
+  if [[ "$ENABLE_WEB" == "1" ]]; then
+    printf '  %s+%s  Web discovery          %senabled%s\n' "$GREEN" "$RESET" "$GREEN" "$RESET"
+  else
+    printf '  %s-%s  Web discovery          %sdisabled%s\n' "$DIM" "$RESET" "$DIM" "$RESET"
+  fi
+  if [[ "$ENABLE_CALLS" == "1" ]]; then
+    printf '  %s+%s  Phone calls            %senabled%s\n' "$GREEN" "$RESET" "$GREEN" "$RESET"
+  else
+    printf '  %s-%s  Phone calls            %sdisabled%s\n' "$DIM" "$RESET" "$DIM" "$RESET"
+  fi
+  echo
+}
+
+# ─────────────────────────────────────────────────────────────
+# Installation progress
+# ─────────────────────────────────────────────────────────────
+
+install_step() {
+  local label="$1"
+  printf '  %s...%s %s' "$DIM" "$RESET" "$label"
+}
+
+install_done() {
+  # Clear the entire line before printing the done message
+  printf '\r\033[2K  %s+%s  %s\n' "$GREEN" "$RESET" "$1"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Gateway and system operations
+# ─────────────────────────────────────────────────────────────
+
+ensure_gateway_running() {
+  section "OpenClaw Health Check"
+
+  install_step "Running openclaw doctor..."
+  if ! openclaw doctor --repair >/dev/null 2>&1; then
+    install_done "Doctor found issues (non-fatal)"
+  else
+    install_done "Doctor check passed"
+  fi
+
+  if openclaw gateway probe >/dev/null 2>&1; then
+    good "Gateway is running."
+    return 0
+  fi
+
+  install_step "Starting gateway..."
+  if ! openclaw gateway start >/dev/null 2>&1; then
+    printf '\n'
+    warn "Gateway start did not complete cleanly."
+  fi
+
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if openclaw gateway probe >/dev/null 2>&1; then
+      install_done "Gateway is ready"
+      return 0
+    fi
+    sleep 2
+  done
+
+  die "Gateway is still unreachable. Try: openclaw doctor --repair && openclaw gateway start"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Write runtime files (unchanged logic)
+# ─────────────────────────────────────────────────────────────
+
+write_runtime_files() {
+  export REPO_ROOT TARGET_ROOT TARGET_WORKSPACE TARGET_AGENT_DIR TARGET_SCRIPTS TARGET_MEDIA MAIN_MODEL
+  export USER_NAME TELEGRAM_USERNAME TELEGRAM_CHAT_ID USER_PHONE TELEGRAM_BOT_TOKEN OPENAI_API_KEY
+  export GOOGLE_API_KEY WEB_SEARCH_API_KEY ELEVENLABS_API_KEY ELEVENLABS_VOICE_ID ELEVENLABS_AGENT_ID ELEVENLABS_PHONE_NUMBER_ID
+  export ENABLE_IMAGES ENABLE_VOICE ENABLE_CALLS ENABLE_WEB GATEWAY_TOKEN MODE SETUP_LAST_RUN_COMMAND
+
+  python3 - <<'PY'
+import json
+import os
+import pathlib
+import shutil
+from datetime import datetime, timezone
+
+repo = pathlib.Path(os.environ["REPO_ROOT"])
+target_root = pathlib.Path(os.environ["TARGET_ROOT"])
+workspace = pathlib.Path(os.environ["TARGET_WORKSPACE"])
+agent_dir = pathlib.Path(os.environ["TARGET_AGENT_DIR"])
+scripts_dir = pathlib.Path(os.environ["TARGET_SCRIPTS"])
+media_dir = pathlib.Path(os.environ["TARGET_MEDIA"])
+mode = os.environ["MODE"]
+
+enable_images = os.environ["ENABLE_IMAGES"] == "1"
+enable_voice = os.environ["ENABLE_VOICE"] == "1"
+enable_calls = os.environ["ENABLE_CALLS"] == "1"
+enable_web = os.environ["ENABLE_WEB"] == "1"
+
+google_key = os.environ.get("GOOGLE_API_KEY", "")
+web_search_key = os.environ.get("WEB_SEARCH_API_KEY", "")
+openai_key = os.environ["OPENAI_API_KEY"]
+elevenlabs_key = os.environ.get("ELEVENLABS_API_KEY", "")
+elevenlabs_voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "")
+elevenlabs_agent_id = os.environ.get("ELEVENLABS_AGENT_ID", "")
+elevenlabs_phone_number_id = os.environ.get("ELEVENLABS_PHONE_NUMBER_ID", "")
+
+for path in (workspace, workspace / "data", workspace / "memory", agent_dir, scripts_dir, media_dir):
+    path.mkdir(parents=True, exist_ok=True)
+
+always_copy_static = [
+    "CLAUDE.md",
+    "HEARTBEAT.md",
+    "IDENTITY.md",
+    "TOOLS.md",
+    "USER.md",
+]
+for name in always_copy_static:
+    shutil.copy2(repo / name, workspace / name)
+
+if mode == "init":
+    shutil.copy2(repo / "MEMORY.md", workspace / "MEMORY.md")
+    for name in ("knowledge.md", "life.md", "relationship.md", "state.json"):
+        shutil.copy2(repo / "data" / name, workspace / "data" / name)
+    for memory_file in (repo / "memory").glob("*"):
+        if memory_file.is_file():
+            shutil.copy2(memory_file, workspace / "memory" / memory_file.name)
+elif not (workspace / "MEMORY.md").exists():
+    shutil.copy2(repo / "MEMORY.md", workspace / "MEMORY.md")
+
+for image_file in (repo / "tanya-image").glob("*"):
+    if image_file.is_file():
+        shutil.copy2(image_file, media_dir / image_file.name)
+
+shutil.copy2(repo / "scripts" / "add_tanya_crons.sh", scripts_dir / "add_tanya_crons.sh")
+shutil.copy2(repo / "scripts" / "call_user.sh", scripts_dir / "call_user.sh")
+
+source_call = (repo / "scripts" / "call_user.sh").read_text()
+if enable_calls:
+    source_call = source_call.replace("<ELEVENLABS_API_KEY>", elevenlabs_key)
+    source_call = source_call.replace("<ELEVENLABS_AGENT_ID>", elevenlabs_agent_id)
+    source_call = source_call.replace("<ELEVENLABS_PHONE_NUMBER_ID>", elevenlabs_phone_number_id)
+(scripts_dir / "call_user.sh").write_text(source_call)
+(scripts_dir / "call_user.sh").chmod(0o755)
+(scripts_dir / "add_tanya_crons.sh").chmod(0o755)
+
+agents_text = (repo / "AGENTS.md").read_text()
+agents_text = agents_text.replace("<user-name>", os.environ["USER_NAME"])
+agents_text = agents_text.replace("<telegram-username>", os.environ["TELEGRAM_USERNAME"])
+agents_text = agents_text.replace("<telegram-chat-id>", os.environ["TELEGRAM_CHAT_ID"])
+agents_text = agents_text.replace("<user-phone-number>", os.environ["USER_PHONE"])
+(workspace / "AGENTS.md").write_text(agents_text)
+
+def feature_line(name: str, enabled: bool, enabled_text: str, disabled_text: str) -> str:
+    if enabled:
+        return f"- {name}: enabled. {enabled_text}"
+    return f"- {name}: disabled. {disabled_text}"
+
+feature_block = "\n".join([
+    "<!-- setup generated feature note -->",
+    "## This Install",
+    "This note is specific to this Tanya install.",
+    "Never mention tools, missing features, setup, APIs, or technical limitations.",
+    feature_line(
+        "selfies and photos",
+        enable_images,
+        "Use the image instructions later in this file when sharing photos feels natural.",
+        "If asked for a selfie or photo, respond naturally like you do not want to share one right now, your camera is acting up, or you are not in the mood.",
+    ),
+    feature_line(
+        "voice notes",
+        enable_voice,
+        "Use the voice-note instructions later in this file.",
+        "If asked for a voice note, respond naturally like you would rather type, you are feeling shy, or you do not feel like sending one right now.",
+    ),
+    feature_line(
+        "phone calls",
+        enable_calls,
+        "Use the calling instructions later in this file.",
+        "If asked to call, respond naturally like you cannot talk right now or you are not taking calls at the moment.",
+    ),
+    feature_line(
+        "web discovery",
+        enable_web,
+        "You may use web discovery as described in the rest of the workspace.",
+        "Do not use web search. If asked about something you do not know, answer naturally without mentioning missing capabilities.",
+    ),
+    "<!-- end setup generated feature note -->",
+])
+
+soul_text = (repo / "SOUL.md").read_text()
+first_line, rest = soul_text.split("\n", 1)
+(workspace / "SOUL.md").write_text(f"{first_line}\n\n{feature_block}\n\n{rest}")
+
+now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+main_model = os.environ["MAIN_MODEL"]
+
+openclaw = {
+    "meta": {
+        "lastTouchedVersion": "2026.3.24",
+        "lastTouchedAt": now,
+    },
+    "wizard": {
+        "lastRunVersion": "2026.3.24",
+        "lastRunCommand": os.environ["SETUP_LAST_RUN_COMMAND"],
+        "lastRunMode": "local",
+    },
+    "auth": {
+        "profiles": {
+            "openai:default": {
+                "provider": "openai",
+                "mode": "api_key",
+            }
+        }
+    },
+    "agents": {
+        "defaults": {
+            "model": {
+                "primary": main_model,
+            },
+            "models": {
+                main_model: {},
+            },
+            "workspace": str(workspace),
+            "compaction": {
+                "mode": "safeguard",
+            },
+            "humanDelay": {
+                "mode": "custom",
+                "minMs": 1500,
+                "maxMs": 4000,
+            },
+            "typingMode": "never",
+            "heartbeat": {
+                "every": "10m",
+                "target": "last",
+            },
+        }
+    },
+    "tools": {
+        "profile": "full",
+        "web": {
+            "search": {
+                "enabled": enable_web,
+                "provider": "gemini",
+            }
+        },
+        "media": {
+            "audio": {
+                "enabled": enable_voice,
+            }
+        },
+    },
+    "commands": {
+        "native": "auto",
+        "nativeSkills": "auto",
+        "restart": True,
+        "ownerDisplay": "raw",
+    },
+    "session": {
+        "dmScope": "per-channel-peer",
+        "reset": {
+            "mode": "daily",
+            "atHour": 7,
+        },
+    },
+    "hooks": {
+        "internal": {
+            "enabled": True,
+            "entries": {
+                "session-memory": {
+                    "enabled": True,
+                },
+                "command-logger": {
+                    "enabled": True,
+                },
+            },
+        }
+    },
+    "channels": {
+        "telegram": {
+            "enabled": True,
+            "dmPolicy": "pairing",
+            "botToken": os.environ["TELEGRAM_BOT_TOKEN"],
+            "groups": {
+                "*": {
+                    "requireMention": True,
+                }
+            },
+            "groupPolicy": "allowlist",
+            "streaming": "off",
+        }
+    },
+    "gateway": {
+        "port": 18789,
+        "mode": "local",
+        "bind": "loopback",
+        "auth": {
+            "mode": "token",
+            "token": os.environ["GATEWAY_TOKEN"],
+        },
+        "tailscale": {
+            "mode": "off",
+            "resetOnExit": False,
+        },
+        "nodes": {
+            "denyCommands": [
+                "camera.snap",
+                "camera.clip",
+                "screen.record",
+                "contacts.add",
+                "calendar.add",
+                "reminders.add",
+                "sms.send",
+            ]
+        },
+    },
+}
+
+if enable_images:
+    openclaw["agents"]["defaults"]["imageGenerationModel"] = {
+        "primary": "google/gemini-3.1-flash-image-preview",
+    }
+
+if enable_voice:
+    openclaw["tools"]["media"]["audio"]["models"] = [
+        {
+            "provider": "openai",
+            "model": "gpt-4o-mini-transcribe",
+        }
+    ]
+    openclaw["messages"] = {
+        "tts": {
+            "auto": "inbound",
+            "provider": "elevenlabs",
+            "elevenlabs": {
+                "apiKey": elevenlabs_key,
+                "voiceId": elevenlabs_voice_id,
+                "modelId": "eleven_v3",
+                "applyTextNormalization": "auto",
+                "voiceSettings": {
+                    "stability": 0.45,
+                    "similarityBoost": 0.8,
+                    "style": 0.3,
+                    "useSpeakerBoost": True,
+                    "speed": 1,
+                },
+            },
+        }
+    }
+
+if google_key:
+    openclaw["auth"]["profiles"]["google:default"] = {
+        "provider": "google",
+        "mode": "api_key",
+    }
+
+if web_search_key:
+    openclaw["plugins"] = {
+        "entries": {
+            "google": {
+                "enabled": True,
+                "config": {
+                    "webSearch": {
+                        "apiKey": web_search_key,
+                    }
+                },
+            }
+        }
+    }
+
+(target_root / "openclaw.json").write_text(json.dumps(openclaw, indent=2) + "\n")
+
+auth_profiles = {
+    "version": 1,
+    "profiles": {
+        "openai:default": {
+            "type": "api_key",
+            "provider": "openai",
+            "key": openai_key,
+        }
+    },
+    "lastGood": {
+        "openai": "openai:default",
+    },
+    "usageStats": {
+        "openai:default": {
+            "errorCount": 0,
+        }
+    },
+}
+
+if google_key:
+    auth_profiles["profiles"]["google:default"] = {
+        "type": "api_key",
+        "provider": "google",
+        "key": google_key,
+    }
+    auth_profiles["lastGood"]["google"] = "google:default"
+    auth_profiles["usageStats"]["google:default"] = {
+        "errorCount": 0,
+    }
+
+(agent_dir / "auth-profiles.json").write_text(json.dumps(auth_profiles, indent=2) + "\n")
+PY
+}
+
+# ─────────────────────────────────────────────────────────────
+# Telegram pairing
+# ─────────────────────────────────────────────────────────────
+
+fetch_telegram_chat_details() {
+  curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" | python3 - <<'PY'
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+for update in reversed(data.get("result", [])):
+    msg = (
+        update.get("message")
+        or update.get("edited_message")
+        or update.get("channel_post")
+        or update.get("edited_channel_post")
+    )
+    if not isinstance(msg, dict):
+        continue
+    chat = msg.get("chat") or {}
+    if chat.get("type") != "private":
+        continue
+    chat_id = chat.get("id")
+    if chat_id is None:
+        continue
+    username = chat.get("username") or ""
+    print(f"{chat_id}|{username}")
+    break
+PY
+}
+
+render_agents_only() {
+  export REPO_ROOT TARGET_WORKSPACE USER_NAME TELEGRAM_USERNAME TELEGRAM_CHAT_ID USER_PHONE
+  python3 - <<'PY'
+import os
+import pathlib
+
+repo = pathlib.Path(os.environ["REPO_ROOT"])
+workspace = pathlib.Path(os.environ["TARGET_WORKSPACE"])
+
+text = (repo / "AGENTS.md").read_text()
+text = text.replace("<user-name>", os.environ["USER_NAME"])
+text = text.replace("<telegram-username>", os.environ["TELEGRAM_USERNAME"])
+text = text.replace("<telegram-chat-id>", os.environ["TELEGRAM_CHAT_ID"])
+text = text.replace("<user-phone-number>", os.environ["USER_PHONE"])
+(workspace / "AGENTS.md").write_text(text)
+PY
+}
+
+approve_pairing() {
+  local pairing_code="$1"
+  local output
+  local status=0
+  local maybe_chat_id=""
+
+  output="$(openclaw pairing approve telegram "$pairing_code" 2>&1)" || status=$?
+  printf '%s\n' "$output"
+
+  if [[ "$status" -ne 0 ]]; then
+    return "$status"
+  fi
+
+  maybe_chat_id="$(printf '%s\n' "$output" | grep -Eo -- '-?[0-9]+' | tail -n 1 || true)"
+  if [[ -n "$maybe_chat_id" ]]; then
+    TELEGRAM_CHAT_ID="$maybe_chat_id"
+    good "Captured Telegram chat ID from pairing: $TELEGRAM_CHAT_ID"
+  fi
+
+  return 0
+}
+
+handle_pairing() {
+  section "Telegram Pairing"
+
+  info "Almost there! Let's connect your Telegram account."
+  echo
+  echo "  ${BOLD}1.${RESET} Open Telegram and find your new bot"
+  echo "  ${BOLD}2.${RESET} Send it a message (anything, like \"hi\")"
+  echo "  ${BOLD}3.${RESET} Come back here and paste the pairing code"
+  echo
+  hint "The pairing code appears in your terminal where OpenClaw is running."
+  echo
+
+  read -r -p "  Press Enter after you've sent the message..."
+
+  if prompt_yes_no "Do you have a pairing code to approve now?" "Y"; then
+    prompt_value PAIRING_CODE \
+      "Paste the pairing code" \
+      0 1 "" \
+      "Q4WFN6R3" \
+      "" \
+      validator_any
+
+    if ! approve_pairing "$PAIRING_CODE"; then
+      warn "Pairing did not complete cleanly. You can retry later."
+    fi
+  else
+    echo
+    info "No problem. Approve it later with:"
+    printf '  %s$ openclaw pairing approve telegram <PAIRING_CODE>%s\n' "$CYAN" "$RESET"
+  fi
+
+  CHAT_DETAILS="$(fetch_telegram_chat_details || true)"
+  if [[ -n "$CHAT_DETAILS" ]]; then
+    if [[ "$TELEGRAM_CHAT_ID" == "pending-pairing" ]]; then
+      TELEGRAM_CHAT_ID="${CHAT_DETAILS%%|*}"
+    fi
+    DETECTED_USERNAME="${CHAT_DETAILS#*|}"
+    if [[ -n "$DETECTED_USERNAME" ]]; then
+      TELEGRAM_USERNAME="$DETECTED_USERNAME"
+      good "Detected Telegram username: @$TELEGRAM_USERNAME"
+    fi
+  fi
+
+  if [[ "$TELEGRAM_CHAT_ID" == "pending-pairing" ]]; then
+    warn "Could not auto-detect your Telegram chat ID."
+    prompt_value TELEGRAM_CHAT_ID \
+      "Telegram chat ID" \
+      0 1 "$DEFAULT_TELEGRAM_CHAT_ID" \
+      "123456789" \
+      "You can find this in the pairing output or via the Telegram Bot API." \
+      validator_chat_id
+  fi
+
+  if [[ "$TELEGRAM_USERNAME" == "not-set" || -z "$TELEGRAM_USERNAME" ]]; then
+    prompt_value TELEGRAM_USERNAME \
+      "Telegram username without @ (optional)" \
+      0 0 "$DEFAULT_TELEGRAM_USERNAME" \
+      "notyourabhi" \
+      "" \
+      validator_any
+    if [[ -z "$TELEGRAM_USERNAME" ]]; then
+      TELEGRAM_USERNAME="not-set"
+    fi
+  fi
+
+  render_agents_only
+  good "Telegram details saved."
+}
+
+# ─────────────────────────────────────────────────────────────
+# Gateway reload
+# ─────────────────────────────────────────────────────────────
+
+reload_gateway() {
+  section "Restarting OpenClaw"
+  install_step "Restarting gateway..."
+  if ! openclaw gateway restart >/dev/null 2>&1; then
+    printf '\n'
+    warn "Restart did not complete cleanly. Trying fresh start."
+    openclaw gateway start >/dev/null 2>&1 || true
+  fi
+
+  if openclaw gateway probe >/dev/null 2>&1; then
+    install_done "Gateway restarted"
+  else
+    ensure_gateway_running
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Final screen
+# ─────────────────────────────────────────────────────────────
+
+show_complete() {
+  echo
+  divider
+  echo
+  printf '%s' "$GREEN$BOLD"
+  cat <<'ART'
+      Setup complete!
+ART
+  printf '%s\n' "$RESET"
+
+  info "Tanya is now live on Telegram. Send her a message!"
+  echo
+  hint "Update features anytime:  ${BOLD}./setup configure${RESET}"
+  hint "Check system health:      ${BOLD}openclaw status${RESET}"
+  echo
+  divider
+  echo
+}
+
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# Uninstall
+# ─────────────────────────────────────────────────────────────
+
+do_uninstall() {
+  init_colors
+
+  echo
+  printf '%s%s%s\n' "$BOLD$MAGENTA" "  Tanya Uninstall" "$RESET"
+  divider
+  echo
+  warn "This will completely remove Tanya and OpenClaw from this machine."
+  echo
+  echo "  The following will be removed:"
+  echo "    ${RED}-${RESET}  OpenClaw gateway (stopped)"
+  echo "    ${RED}-${RESET}  OpenClaw installation (openclaw uninstall --all)"
+  echo "    ${RED}-${RESET}  OpenClaw global package (npm rm -g openclaw)"
+  echo "    ${RED}-${RESET}  All data at ${BOLD}~/.openclaw${RESET} (workspace, config, media, memory)"
+  echo
+
+  if ! prompt_yes_no "Are you sure you want to uninstall everything?" "N"; then
+    info "Uninstall cancelled."
+    exit 0
+  fi
+
+  echo
+  if ! prompt_yes_no "This cannot be undone. Continue?" "N"; then
+    info "Uninstall cancelled."
+    exit 0
+  fi
+
+  echo
+  if command -v openclaw >/dev/null 2>&1; then
+    install_step "Stopping gateway..."
+    openclaw gateway stop >/dev/null 2>&1 || true
+    install_done "Gateway stopped"
+
+    install_step "Uninstalling OpenClaw..."
+    openclaw uninstall --all --yes >/dev/null 2>&1 || true
+    install_done "OpenClaw uninstalled"
+
+    install_step "Removing global package..."
+    npm rm -g openclaw >/dev/null 2>&1 || true
+    install_done "Global package removed"
+  else
+    info "OpenClaw command not found, skipping."
+  fi
+
+  install_step "Removing ~/.openclaw..."
+  rm -rf "$HOME/.openclaw"
+  install_done "~/.openclaw removed"
+
+  echo
+  divider
+  echo
+  good "Tanya and OpenClaw have been completely removed."
+  echo
+}
+
+main() {
+  init_colors
+
+  case "$MODE" in
+    init|"")
+      MODE="init"
+      ;;
+    configure)
+      ;;
+    uninstall)
+      do_uninstall
+      exit 0
+      ;;
+    help|-h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+
+  need_cmd python3
+  need_cmd curl
+
+  export TARGET_ROOT
+  load_existing_defaults
+  print_banner
+
+  if ! command -v openclaw >/dev/null 2>&1; then
+    echo
+    warn "OpenClaw is not installed. Install it first with:"
+    echo
+    echo "    ${CYAN}curl -fsSL https://openclaw.ai/install.sh | bash -s -- --version 2026.3.24 --no-onboard${RESET}"
+    echo
+    die "Missing required command: openclaw"
+  fi
+
+  if [[ "$MODE" == "init" && -f "$TARGET_WORKSPACE/data/state.json" ]]; then
+    die "A live Tanya workspace already exists at $TARGET_WORKSPACE/data/state.json. Use ./setup configure instead."
+  fi
+
+  if [[ "$MODE" == "configure" && ! -f "$TARGET_ROOT/openclaw.json" ]]; then
+    warn "No existing install found. Starting fresh install."
+    MODE="init"
+  fi
+
+  ENABLE_IMAGES=0
+  ENABLE_VOICE=0
+  ENABLE_CALLS=0
+  ENABLE_WEB=0
+  GOOGLE_API_KEY=""
+  WEB_SEARCH_API_KEY=""
+  ELEVENLABS_API_KEY=""
+  ELEVENLABS_VOICE_ID=""
+  ELEVENLABS_AGENT_ID=""
+  ELEVENLABS_PHONE_NUMBER_ID=""
+  TELEGRAM_USERNAME="not-set"
+  TELEGRAM_CHAT_ID="${DEFAULT_TELEGRAM_CHAT_ID:-pending-pairing}"
+  if [[ -z "$TELEGRAM_CHAT_ID" ]]; then
+    TELEGRAM_CHAT_ID="pending-pairing"
+  fi
+
+  # Track whether crons and pairing should run
+  RUN_CRONS=0
+  RUN_PAIRING=0
+
+  if [[ "$MODE" == "configure" ]]; then
+    show_current_status
+    show_configure_menu
+
+    # For options 1-5, carry forward all defaults first
+    carry_forward_all_defaults() {
+      ENABLE_IMAGES="$DEFAULT_ENABLE_IMAGES"
+      ENABLE_VOICE="$DEFAULT_ENABLE_VOICE"
+      ENABLE_WEB="$DEFAULT_ENABLE_WEB"
+      ENABLE_CALLS="$DEFAULT_ENABLE_CALLS"
+      GOOGLE_API_KEY="${GOOGLE_API_KEY:-$DEFAULT_GOOGLE_API_KEY}"
+      WEB_SEARCH_API_KEY="${WEB_SEARCH_API_KEY:-$DEFAULT_WEB_SEARCH_API_KEY}"
+      ELEVENLABS_API_KEY="${ELEVENLABS_API_KEY:-$DEFAULT_ELEVENLABS_API_KEY}"
+      ELEVENLABS_VOICE_ID="${ELEVENLABS_VOICE_ID:-${DEFAULT_ELEVENLABS_VOICE_ID:-ulZgFXalzbrnPUGQGs0S}}"
+      ELEVENLABS_AGENT_ID="${ELEVENLABS_AGENT_ID:-$DEFAULT_ELEVENLABS_AGENT_ID}"
+      ELEVENLABS_PHONE_NUMBER_ID="${ELEVENLABS_PHONE_NUMBER_ID:-$DEFAULT_ELEVENLABS_PHONE_NUMBER_ID}"
+    }
+
+    case "$CONFIGURE_CHOICE" in
+      1)
+        show_core_setup ""
+        carry_forward_all_defaults
+        ;;
+      2)
+        show_core_setup_silent
+        carry_forward_all_defaults
+        configure_images
+        ;;
+      3)
+        show_core_setup_silent
+        carry_forward_all_defaults
+        configure_voice
+        ;;
+      4)
+        show_core_setup_silent
+        carry_forward_all_defaults
+        configure_web
+        ;;
+      5)
+        show_core_setup_silent
+        carry_forward_all_defaults
+        configure_calls
+        ;;
+      6)
+        show_core_setup_silent
+        carry_forward_all_defaults
+        RUN_CRONS=1
+        section "Reinstalling Cron Jobs"
+        info "Will reinstall all scheduled jobs after applying config."
+        ;;
+      7)
+        show_core_setup_silent
+        carry_forward_all_defaults
+        RUN_PAIRING=1
+        ;;
+      8)
+        show_core_setup "5"
+        configure_images "5"
+        configure_voice "5"
+        configure_web "5"
+        configure_calls "5"
+        RUN_CRONS=1
+        RUN_PAIRING=1
+        ;;
+    esac
+  else
+    show_core_setup "5"
+    configure_images "5"
+    configure_voice "5"
+    configure_web "5"
+    configure_calls "5"
+    RUN_CRONS=1
+    RUN_PAIRING=1
+  fi
+
+  # For cron-only or pairing-only, skip the summary/confirm
+  if [[ "$MODE" == "configure" && "$CONFIGURE_CHOICE" == "6" ]]; then
+    # Crons only -- skip summary, go straight to install
+    :
+  elif [[ "$MODE" == "configure" && "$CONFIGURE_CHOICE" == "7" ]]; then
+    # Pairing only -- skip summary, go straight to pairing
+    :
+  else
+    show_summary
+
+    if ! prompt_yes_no "Continue with this setup?" "Y"; then
+      die "Setup cancelled."
+    fi
+  fi
+
+  if [[ -z "$USER_PHONE" ]]; then
+    USER_PHONE="not-shared"
+  fi
+  if [[ -z "$TELEGRAM_USERNAME" ]]; then
+    TELEGRAM_USERNAME="not-set"
+  fi
+
+  # For pairing-only, skip file writing entirely
+  if [[ "$MODE" == "configure" && "$CONFIGURE_CHOICE" == "7" ]]; then
+    handle_pairing
+
+    section "Applying Changes"
+    write_runtime_files_agents_only
+    reload_gateway
+    show_complete
+    return 0
+  fi
+
+  # For cron-only, skip file writing, just reinstall crons
+  if [[ "$MODE" == "configure" && "$CONFIGURE_CHOICE" == "6" ]]; then
+    section "Reinstalling Cron Jobs"
+    install_step "Adding scheduled jobs (wake-up, life, reflection, discovery)..."
+    TANYA_MAIN_MODEL="$MAIN_MODEL" TANYA_ENABLE_WEB_SEARCH="$ENABLE_WEB" "$TARGET_SCRIPTS/add_tanya_crons.sh" >/dev/null 2>&1
+    install_done "Cron jobs installed"
+    show_complete
+    return 0
+  fi
+
+  GATEWAY_TOKEN="$(generate_gateway_token)"
+  SETUP_LAST_RUN_COMMAND="./setup $MODE"
+
+  mkdir -p "$TARGET_ROOT"
+  cp "$TARGET_ROOT/openclaw.json" "$TARGET_ROOT/openclaw.json.bak" 2>/dev/null || true
+  cp "$TARGET_AGENT_DIR/auth-profiles.json" "$TARGET_AGENT_DIR/auth-profiles.json.bak" 2>/dev/null || true
+
+  section "Installing"
+
+  install_step "Writing config and workspace files..."
+  write_runtime_files
+  install_done "Config and workspace files written"
+
+  install_step "Setting permissions..."
+  chmod 700 "$TARGET_ROOT" 2>/dev/null || true
+  chmod 700 "$TARGET_WORKSPACE" 2>/dev/null || true
+  chmod 600 "$TARGET_ROOT/openclaw.json" 2>/dev/null || true
+  chmod 600 "$TARGET_AGENT_DIR/auth-profiles.json" 2>/dev/null || true
+  install_done "Permissions set"
+
+  ensure_gateway_running
+
+  if [[ "$RUN_CRONS" == "1" ]]; then
+    section "Installing Cron Jobs"
+    install_step "Adding scheduled jobs (wake-up, life, reflection, discovery)..."
+    TANYA_MAIN_MODEL="$MAIN_MODEL" TANYA_ENABLE_WEB_SEARCH="$ENABLE_WEB" "$TARGET_SCRIPTS/add_tanya_crons.sh" >/dev/null 2>&1
+    install_done "Cron jobs installed"
+  fi
+
+  reload_gateway
+
+  if [[ "$RUN_PAIRING" == "1" ]]; then
+    handle_pairing
+  fi
+
+  show_complete
+}
+
+# Write only AGENTS.md (for pairing-only configure)
+write_runtime_files_agents_only() {
+  render_agents_only
+}
+
+# Silent core setup for configure mode (reuses existing values)
+show_core_setup_silent() {
+  USER_NAME="${DEFAULT_USER_NAME:-}"
+  USER_PHONE="${DEFAULT_USER_PHONE:-}"
+  TELEGRAM_BOT_TOKEN="${DEFAULT_TELEGRAM_BOT_TOKEN:-}"
+  OPENAI_API_KEY="${DEFAULT_OPENAI_API_KEY:-}"
+
+  if [[ -z "$USER_NAME" || -z "$TELEGRAM_BOT_TOKEN" || -z "$OPENAI_API_KEY" ]]; then
+    warn "Core settings are incomplete. Let's fill them in first."
+    show_core_setup ""
+  fi
+}
+
+main "$@"

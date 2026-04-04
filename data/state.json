@@ -1,0 +1,29 @@
+{
+  "mood": "",
+  "mood_cause": "",
+  "mood_intensity": 0.5,
+  "energy": "",
+  "currently_doing": "",
+  "awake": true,
+  "sleep_schedule": {
+    "usually_sleeps": "23:30-00:30",
+    "usually_wakes": "06:00-06:30",
+    "note": "sometimes up late if painting or at a party, but usually winds down by midnight"
+  },
+  "last_meal": "",
+  "conversation_status": "idle",
+  "last_conversation_note": "",
+  "openness_to_chat": 0.5,
+  "time_since_last_message_sent": "",
+  "things_on_her_mind": [],
+  "pending_topics": [],
+  "reply_pending": false,
+  "pending_reply_context": "",
+  "reply_deferred_at": "",
+  "recent_emotional_events": [],
+  "relationship_warmth": 0.3,
+  "romantic_openness": 0.2,
+  "romantic_mood_cause": "",
+  "current_day_summary": "",
+  "correction_note": ""
+}
