@@ -936,7 +936,6 @@ for path in (workspace, workspace / "data", workspace / "memory", agent_dir, scr
     path.mkdir(parents=True, exist_ok=True)
 
 always_copy_static = [
-    "CLAUDE.md",
     "HEARTBEAT.md",
     "IDENTITY.md",
     "TOOLS.md",
