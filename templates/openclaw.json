@@ -47,7 +47,7 @@
       "typingMode": "never",
       "heartbeat": {
         "model": "openai/gpt-5.4-mini",
-        "every": "30m",
+        "every": "60m",
         "target": "last"
       }
     }
