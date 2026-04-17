@@ -2,3 +2,7 @@
 .claude/
 CLAUDE.md
 .env
+.env.*
+!.env.example
+tanya-data/
+docker-compose.override.yml
