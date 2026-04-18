@@ -62,8 +62,6 @@ chmod +x setup
 
 Stops the container and guides you through removing the image, state, and keys.
 
-Requirements: Docker Engine (or Desktop) with the `docker compose` plugin. That's it.
-
 ### Option B — Host install (bare-metal Linux VPS)
 
 Installs OpenClaw directly on the machine. Useful on a small VPS where you'd rather skip the Docker runtime overhead, or when you want the `openclaw` CLI on your shell path for day-to-day ops (status, logs, pairing).
