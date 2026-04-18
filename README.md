@@ -31,15 +31,48 @@ Tanya wakes up in the morning, goes about her day, gets excited about things, ge
 
 ## Quick Start
 
-### 1. Install OpenClaw
+Two ways to run Tanya. Pick one.
 
-Requires a Linux VPS or server. Pinned to version `2026.3.24`:
+### Option A — Docker
+
+Runs everything (OpenClaw + Tanya) inside an isolated sandbox environment. Nothing touches the host except Docker itself. Works on any Linux VPS, a Mac with Docker Desktop, or a home server. Requires Docker with the Compose plugin — the setup wizard detects if it's missing and walks you through installation.
+
+**1. Clone and run:**
+
+```bash
+git clone https://github.com/opxiahub/tanya.git && cd tanya
+chmod +x setup
+./setup docker
+```
+
+- State lives in `./tanya-data/` (bind-mounted into the container)
+- Config in `./.env`
+
+**2. Update features later:**
+
+```bash
+./setup docker
+```
+
+**3. Uninstall:**
+
+```bash
+./setup docker uninstall
+```
+
+Stops the container and guides you through removing the image, state, and keys.
+
+### Option B — Host install (bare-metal Linux VPS)
+
+Installs OpenClaw directly on the machine. Useful on a small VPS where you'd rather skip the Docker runtime overhead, or when you want the `openclaw` CLI on your shell path for day-to-day ops (status, logs, pairing).
+
+**1. Install OpenClaw** (pinned to `2026.3.24`):
 
 ```bash
 curl -fsSL https://openclaw.ai/install.sh | bash -s -- --version 2026.3.24 --no-onboard
 ```
 
-### 2. Run setup
+**2. Run setup:**
 
 ```bash
 git clone https://github.com/opxiahub/tanya.git && cd tanya
@@ -47,26 +80,13 @@ chmod +x setup
 ./setup
 ```
 
-The setup wizard walks you through everything step by step. It will:
-
-- Ask for your name and Telegram bot token
-- Let you pick which features to enable (selfies, voice, web, calls)
-- Only ask for keys needed for the features you turn on
-- Show you exactly where to get each API key
-- Install all config, workspace files, cron jobs, and media
-- Start OpenClaw and help you pair your Telegram account
-
-That's it. You're done.
-
-### 3. Update features later
+**3. Update features later:**
 
 ```bash
 ./setup configure
 ```
 
-Pick what you want to change from a menu. No need to redo the whole setup.
-
-### 4. Uninstall
+**4. Uninstall:**
 
 ```bash
 ./setup uninstall
@@ -128,13 +148,13 @@ To create your own character instead of Tanya:
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---------|-----|
-| Bot doesn't reply | Check pairing: `openclaw pairing approve telegram <CODE>` |
-| Gateway won't start | Run `openclaw doctor --repair && openclaw gateway start` |
-| Voice notes don't work | Verify ElevenLabs key and voice ID in `./setup configure` |
-| No selfies | Verify Google API key in `./setup configure` |
-| General health check | Run `openclaw status` |
+| Problem | Fix (host) | Fix (Docker) |
+|---------|------------|--------------|
+| Bot doesn't reply | `openclaw pairing approve telegram <CODE>` | `docker compose exec tanya openclaw pairing approve telegram <CODE>` |
+| Gateway won't start | `openclaw doctor --repair && openclaw gateway start` | `docker compose restart tanya` (or check logs) |
+| Voice notes don't work | Verify ElevenLabs key in `./setup configure` | Edit `.env`, then `docker compose restart tanya` |
+| No selfies | Verify Google API key in `./setup configure` | Edit `.env`, then `docker compose restart tanya` |
+| General health check | `openclaw status` | `docker compose exec tanya openclaw status` |
 
 ## Notes
 
