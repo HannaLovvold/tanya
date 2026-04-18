@@ -55,6 +55,7 @@ docker compose exec tanya openclaw status
 docker compose restart tanya            # apply .env changes
 docker compose down                     # stop
 docker compose down -v                  # stop and wipe state
+./setup docker uninstall                # stop + guided cleanup (image, tanya-data, .env)
 ```
 
 Requirements: Docker Engine (or Desktop) with the `docker compose` plugin. That's it.

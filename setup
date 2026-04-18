@@ -10,6 +10,7 @@ TARGET_MEDIA="$TARGET_ROOT/media/tanya-image"
 MAIN_MODEL="${TANYA_MAIN_MODEL:-openai/gpt-5.4}"
 MINI_MODEL="${TANYA_MINI_MODEL:-openai/gpt-5.4-mini}"
 MODE="${1:-init}"
+SUBMODE="${2:-}"
 VERSION="1.1.0"
 
 # ─────────────────────────────────────────────────────────────
@@ -121,8 +122,9 @@ usage() {
     ./setup              First-time install (host machine)
     ./setup init         Same as above
     ./setup configure    Update features on an existing install
-    ./setup docker       Install and run Tanya inside a Docker container
-    ./setup uninstall    Remove Tanya and OpenClaw completely
+    ./setup docker             Install and run Tanya inside a Docker container
+    ./setup docker uninstall   Stop the container and optionally clean up image/volumes/data
+    ./setup uninstall          Remove Tanya and OpenClaw completely
 
 EOF
 }
@@ -1650,14 +1652,136 @@ show_complete_docker() {
   echo
 }
 
+docker_install_hint() {
+  local os_id=""
+  local kernel
+  kernel="$(uname -s 2>/dev/null || echo unknown)"
+
+  if [[ "$kernel" == "Darwin" ]]; then
+    echo
+    warn "Docker is not installed."
+    info "On macOS, install Docker Desktop (includes Compose v2):"
+    printf '    %shttps://www.docker.com/products/docker-desktop/%s\n' "$CYAN" "$RESET"
+    printf '    %sOr via Homebrew: brew install --cask docker%s\n' "$CYAN" "$RESET"
+    echo
+    die "Missing required command: docker"
+  fi
+
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    os_id="$(. /etc/os-release && echo "${ID:-}")"
+  fi
+
+  echo
+  warn "Docker is not installed."
+  case "$os_id" in
+    ubuntu|debian)
+      info "On ${os_id}, install Docker Engine + Compose v2 with:"
+      printf '    %scurl -fsSL https://get.docker.com | sh%s\n' "$CYAN" "$RESET"
+      printf '    %ssudo apt-get install -y docker-compose-plugin%s\n' "$CYAN" "$RESET"
+      ;;
+    rhel|fedora|centos|rocky|almalinux|ol)
+      info "On ${os_id}, install Docker Engine + Compose v2 with:"
+      printf '    %scurl -fsSL https://get.docker.com | sh%s\n' "$CYAN" "$RESET"
+      printf '    %ssudo dnf install -y docker-compose-plugin%s\n' "$CYAN" "$RESET"
+      ;;
+    alpine)
+      info "On Alpine, install with:"
+      printf '    %ssudo apk add docker docker-cli-compose%s\n' "$CYAN" "$RESET"
+      ;;
+    arch|manjaro)
+      info "On ${os_id}, install with:"
+      printf '    %ssudo pacman -S docker docker-compose%s\n' "$CYAN" "$RESET"
+      ;;
+    *)
+      info "Install Docker Engine and the Compose v2 plugin for your distro:"
+      printf '    %shttps://docs.docker.com/engine/install/%s\n' "$CYAN" "$RESET"
+      ;;
+  esac
+  case "$os_id" in
+    ubuntu|debian|rhel|fedora|centos|rocky|almalinux|ol|alpine|arch|manjaro)
+      info "Then enable and start the daemon:"
+      printf '    %ssudo systemctl enable --now docker%s\n' "$CYAN" "$RESET"
+      ;;
+  esac
+  echo
+  die "Missing required command: docker"
+}
+
+ensure_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    docker_install_hint
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    die "The 'docker compose' plugin is required. Install Docker Engine/Desktop with the Compose plugin."
+  fi
+}
+
+do_docker_uninstall() {
+  init_colors
+
+  if [[ ! -f "$DOCKER_COMPOSE_FILE" ]]; then
+    die "docker-compose.yml not found in $REPO_ROOT. Are you running this from the repo root?"
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    die "Docker is not installed — nothing to uninstall."
+  fi
+
+  echo
+  printf '%s%s%s\n' "$BOLD$MAGENTA" "  Tanya Docker Uninstall" "$RESET"
+  divider
+  echo
+  warn "This will stop the Tanya container and let you clean up the image and data."
+  echo
+
+  if ! prompt_yes_no "Stop the container and remove its compose resources?" "Y"; then
+    info "Uninstall cancelled."
+    exit 0
+  fi
+
+  echo
+  install_step "Stopping container..."
+  (cd "$REPO_ROOT" && docker compose down) >/dev/null 2>&1 || true
+  install_done "Container stopped"
+
+  echo
+  if prompt_yes_no "Remove the Tanya Docker image (tanya:local)?" "N"; then
+    install_step "Removing image..."
+    docker rmi tanya:local >/dev/null 2>&1 || true
+    install_done "Image removed"
+  fi
+
+  echo
+  if [[ -d "$REPO_ROOT/tanya-data" ]]; then
+    warn "This deletes all of Tanya's state: memories, pairings, logs, generated media."
+    if prompt_yes_no "Delete ${BOLD}${REPO_ROOT}/tanya-data${RESET}?" "N"; then
+      install_step "Deleting tanya-data..."
+      rm -rf "$REPO_ROOT/tanya-data"
+      install_done "tanya-data removed"
+    fi
+  fi
+
+  echo
+  if [[ -f "$REPO_ROOT/.env" ]]; then
+    if prompt_yes_no "Delete ${BOLD}${REPO_ROOT}/.env${RESET} (contains your API keys)?" "N"; then
+      rm -f "$REPO_ROOT/.env"
+      install_done ".env removed"
+    fi
+  fi
+
+  echo
+  divider
+  echo
+  good "Tanya container has been removed."
+  echo
+}
+
 do_docker_setup() {
   init_colors
   need_cmd python3
   need_cmd curl
-  need_cmd docker
-  if ! docker compose version >/dev/null 2>&1; then
-    die "The 'docker compose' plugin is required. Install Docker Engine/Desktop with the Compose plugin."
-  fi
+  ensure_docker
 
   if [[ ! -f "$DOCKER_COMPOSE_FILE" ]]; then
     die "docker-compose.yml not found in $REPO_ROOT. Are you running this from the repo root?"
@@ -1817,7 +1941,11 @@ main() {
     configure)
       ;;
     docker)
-      do_docker_setup
+      if [[ "$SUBMODE" == "uninstall" ]]; then
+        do_docker_uninstall
+      else
+        do_docker_setup
+      fi
       exit 0
       ;;
     uninstall)
